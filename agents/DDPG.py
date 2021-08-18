@@ -10,20 +10,23 @@ from tensorflow.keras.optimizers import Adam
 
 from utils import Portfolio
 
+tf.compat.v1.disable_eager_execution()
 # Tensorflow GPU configuration
+# strategy = tf.distribute.MirroredStrategy()
 config = tf.compat.v1.ConfigProto()
+# 下面这句有用，配合config.gpu_options.per_process_gpu_memory_fraction = GPU_mem_use可以限制住GPU显存的使用(333MB/12GB)
 config.gpu_options.allow_growth = True
 sess = tf.compat.v1.Session(config=config)
 tf.compat.v1.keras.backend.set_session(sess)
-tf.compat.v1.disable_eager_execution()
-
+init = tf.compat.v1.global_variables_initializer()
+sess.run(init)
 
 HIDDEN1_UNITS = 24
 HIDDEN2_UNITS = 48
 HIDDEN3_UNITS = 24
 
 
-# reference: 
+# reference:
 # https://arxiv.org/pdf/1509.02971.pdf
 class ActorNetwork:
     def __init__(self, sess, state_size, action_dim, buffer_size, tau, learning_rate, is_eval=False, model_name=""):
@@ -31,21 +34,27 @@ class ActorNetwork:
         self.tau = tau
         self.learning_rate = learning_rate
         self.action_dim = action_dim
-        if is_eval == True:
+        if is_eval:
             self.model, self.states = self.create_actor_network(state_size, action_dim)
             self.model.load_weights('saved_models/{}_actor.h5'.format(model_name))
         else:
+            # with strategy.scope():
             self.model, self.states = self.create_actor_network(state_size, action_dim)
             self.model_target, self.target_state = self.create_actor_network(state_size, action_dim)
-            self.model_target.set_weights(self.model.get_weights()) # hard copy model parameters to target model parameters
-
+            self.model_target.set_weights(
+                self.model.get_weights())  # hard copy model parameters to target model parameters
             self.action_gradient = tf.compat.v1.placeholder(tf.float32, [None, action_dim])
-            # chain rule: ∂a/∂θ * ∂Q(s,a)/∂a (action_gradients); minus sign for gradient descent; 1/buffer_size for mean value
-            self.sampled_policy_grad = tf.gradients(self.model.output/buffer_size, self.model.trainable_weights, -self.action_gradient)
-            self.update_actor_policy = Adam(learning_rate=learning_rate).apply_gradients(zip(self.sampled_policy_grad, self.model.trainable_weights))
+            # chain rule: ∂a/∂θ * ∂Q(s,a)/∂a (action_gradients);
+            # minus sign for gradient descent; 1/buffer_size for mean value
+            self.sampled_policy_grad = tf.gradients(self.model.output / buffer_size,
+                                                    self.model.trainable_weights,
+                                                    -self.action_gradient)
+            self.update_actor_policy = Adam(learning_rate=learning_rate).apply_gradients(
+                zip(self.sampled_policy_grad, self.model.trainable_weights))
 
     def train(self, states_batch, action_grads_batch):
-        self.sess.run(self.update_actor_policy, feed_dict={self.states: states_batch, self.action_gradient: action_grads_batch})
+        self.sess.run(self.update_actor_policy,
+                      feed_dict={self.states: states_batch, self.action_gradient: action_grads_batch})
 
     def train_target(self):
         actor_weights = self.model.get_weights()
@@ -55,12 +64,17 @@ class ActorNetwork:
         self.model_target.set_weights(actor_target_weights)
 
     def create_actor_network(self, state_size, action_dim):
+        # 多 GPU 同时训练 strategy = tf.distribute.MirroredStrategy(["GPU:0", "GPU:1"]), 默认为全部GPU
+        # https://www.tensorflow.org/api_docs/python/tf/distribute/MirroredStrategy
+        # strategy = tf.distribute.MirroredStrategy()
+        # with strategy.scope():
         states = Input(shape=[state_size])
         h0 = Dense(HIDDEN1_UNITS, activation='relu')(states)
         h1 = Dense(HIDDEN2_UNITS, activation='relu')(h0)
         h2 = Dense(HIDDEN3_UNITS, activation='relu')(h1)
         actions = Dense(self.action_dim, activation='softmax')(h2)
         model = Model(inputs=states, outputs=actions)
+
         return model, states
 
 
@@ -70,12 +84,15 @@ class CriticNetwork:
         self.tau = tau
         self.learning_rate = learning_rate
         self.action_dim = action_dim
-        if is_eval == True:
+        if is_eval:
+            # with strategy.scope():
             self.model, self.actions, self.states = self.create_critic_network(state_size, action_dim)
             self.model.load_weights('saved_models/{}_critic.h5'.format(model_name))
         else:
+            # with strategy.scope():
             self.model, self.actions, self.states = self.create_critic_network(state_size, action_dim)
-            self.model_target, self.target_action, self.target_state = self.create_critic_network(state_size, action_dim)
+            self.model_target, self.target_action, self.target_state = self.create_critic_network(state_size,
+                                                                                                  action_dim)
             self.action_grads = tf.gradients(self.model.output, self.actions)
 
     def gradients(self, states_batch, actions_batch):
@@ -89,6 +106,9 @@ class CriticNetwork:
         self.model_target.set_weights(critic_target_weights)
 
     def create_critic_network(self, state_size, action_dim):
+        # 多 GPU 同时训练 strategy = tf.distribute.MirroredStrategy(["GPU:0", "GPU:1"]), 默认为全部GPU
+        # https://www.tensorflow.org/api_docs/python/tf/distribute/MirroredStrategy
+        # with strategy.scope():
         states = Input(shape=[state_size])
         actions = Input(shape=[action_dim])
         h0 = Concatenate()([states, actions])
@@ -137,14 +157,17 @@ class Agent(Portfolio):
         self.memory = deque(maxlen=100)
         self.buffer_size = 90
 
-        self.gamma = 0.95 # discount factor
+        self.gamma = 0.95  # discount factor
         self.is_eval = is_eval
         self.noise = OUNoise(self.action_dim)
         tau = 0.001  # Target network hyperparameter
         learning_rate_actor = 0.001  # learning rate for Actor network
         learning_rate_critic = 0.001  # learning rate for Critic network
 
-        self.actor = ActorNetwork(sess, state_dim, self.action_dim, self.buffer_size, tau, learning_rate_actor, is_eval, model_name)
+        # with strategy.scope():
+        self.actor = ActorNetwork(sess, state_dim, self.action_dim, self.buffer_size, tau, learning_rate_actor,
+                                  is_eval,
+                                  model_name)
         self.critic = CriticNetwork(sess, state_dim, self.action_dim, tau, learning_rate_critic)
 
         self.tensorboard = tf.keras.callbacks.TensorBoard(log_dir='./logs/DDPG_tensorboard', update_freq=90)
@@ -155,7 +178,7 @@ class Agent(Portfolio):
         self.noise.reset()
 
     def remember(self, state, actions, reward, next_state, done):
-    	self.memory.append((state, actions, reward, next_state, done))
+        self.memory.append((state, actions, reward, next_state, done))
 
     def act(self, state, t):
         actions = self.actor.model.predict(state)[0]
@@ -170,23 +193,25 @@ class Agent(Portfolio):
         y_batch = []
         for state, actions, reward, next_state, done in mini_batch:
             if not done:
-                Q_target_value = self.critic.model_target.predict([next_state, self.actor.model_target.predict(next_state)])
+                Q_target_value = self.critic.model_target.predict(
+                    [next_state, self.actor.model_target.predict(next_state)])
                 y = reward + self.gamma * Q_target_value
             else:
                 y = reward * np.ones((1, self.action_dim))
             y_batch.append(y)
 
         y_batch = np.vstack(y_batch)
-        states_batch = np.vstack([tup[0] for tup in mini_batch]) # batch_size * state_dim
-        actions_batch = np.vstack([tup[1] for tup in mini_batch]) # batch_size * action_dim
-        
+        states_batch = np.vstack([tup[0] for tup in mini_batch])  # batch_size * state_dim
+        actions_batch = np.vstack([tup[1] for tup in mini_batch])  # batch_size * action_dim
+
         # update critic by minimizing the loss
         loss = self.critic.model.train_on_batch([states_batch, actions_batch], y_batch)
 
         # update actor using the sampled policy gradients
-        action_grads_batch = self.critic.gradients(states_batch, self.actor.model.predict(states_batch)) # batch_size * action_dim
+        action_grads_batch = self.critic.gradients(states_batch,
+                                                   self.actor.model.predict(states_batch))  # batch_size * action_dim
         self.actor.train(states_batch, action_grads_batch)
-        
+
         # update target networks
         self.actor.train_target()
         self.critic.train_target()
